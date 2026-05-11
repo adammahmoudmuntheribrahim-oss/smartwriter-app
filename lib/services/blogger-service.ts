@@ -1,29 +1,20 @@
 import axios, { AxiosInstance, AxiosError } from 'axios';
-import { useLogsStore } from '@/lib/stores/logs.store';
+import * as AuthSession from 'expo-auth-session';
+import * as WebBrowser from 'expo-web-browser';
 import { secureStorage } from '@/lib/_core/secure-store';
+import { useLogsStore } from '@/lib/stores/logs.store';
+import { useAuthStore } from '@/lib/stores/auth.store';
+
+WebBrowser.maybeCompleteAuthSession();
 
 export interface BloggerPost {
-  id: string;
-  title: string;
-  content: string;
-  published: string;
-  updated: string;
-  url: string;
-  status: 'LIVE' | 'DRAFT';
-  labels?: string[];
-}
-
-export interface CreatePostRequest {
+  id?: string;
   title: string;
   content: string;
   labels?: string[];
-  isDraft?: boolean;
-}
-
-export interface UpdatePostRequest {
-  title?: string;
-  content?: string;
-  labels?: string[];
+  status?: 'LIVE' | 'DRAFT' | 'SCHEDULED';
+  published?: string;
+  url?: string;
 }
 
 export class BloggerService {
@@ -32,31 +23,25 @@ export class BloggerService {
   private accessToken: string | null = null;
   private blogId: string | null = null;
 
+  private readonly GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+  private readonly SCOPES = ['https://www.googleapis.com/auth/blogger'];
+
   private constructor() {
     this.client = axios.create({
       baseURL: 'https://www.googleapis.com/blogger/v3',
-      timeout: 30000,
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      timeout: 15000,
     });
 
-    // Add request interceptor for SSL-only and auth
-    this.client.interceptors.request.use((config) => {
+    this.client.interceptors.request.use(async (config) => {
       if (this.accessToken) {
         config.headers.Authorization = `Bearer ${this.accessToken}`;
-      }
-      // Ensure HTTPS
-      if (config.url && !config.url.startsWith('https')) {
-        config.url = config.url.replace(/^http:/, 'https:');
       }
       return config;
     });
 
-    // Add response interceptor for error handling
     this.client.interceptors.response.use(
       (response) => response,
-      (error: AxiosError) => {
+      (error) => {
         this.handleError(error);
         return Promise.reject(error);
       }
@@ -70,348 +55,121 @@ export class BloggerService {
     return BloggerService.instance;
   }
 
-  /**
-   * Initialize the service with access token and blog ID
-   */
-  async initialize(accessToken: string, blogId: string): Promise<void> {
-    try {
-      this.accessToken = accessToken;
-      this.blogId = blogId;
+  async setBlogId(id: string) {
+    this.blogId = id;
+    await secureStorage.setItem('blogger_blog_id', id);
+  }
 
-      // Store token securely
-      await secureStorage.setItem('blogger_access_token', accessToken);
-      await secureStorage.setItem('blogger_blog_id', blogId);
+  async getBlogId() {
+    if (!this.blogId) {
+      this.blogId = await secureStorage.getItem('blogger_blog_id');
+    }
+    return this.blogId;
+  }
 
-      useLogsStore.getState().addLog({
-        level: 'success',
-        message: 'Blogger service initialized',
-        context: 'BloggerService',
-        data: { blogId },
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Failed to initialize Blogger service',
-        context: 'BloggerService',
-        data: { error: errorMessage },
-      });
-      throw error;
+  async loadCredentials() {
+    this.accessToken = await secureStorage.getItem('blogger_access_token');
+    this.blogId = await secureStorage.getItem('blogger_blog_id');
+    if (this.accessToken) {
+      useAuthStore.getState().setAuthenticated(true);
     }
   }
 
-  /**
-   * Load stored credentials
-   */
-  async loadCredentials(): Promise<boolean> {
+  async login(clientId: string) {
     try {
-      const token = await secureStorage.getItem('blogger_access_token');
-      const blogId = await secureStorage.getItem('blogger_blog_id');
+      const redirectUri = AuthSession.makeRedirectUri();
+      const request = new AuthSession.AuthRequest({
+        clientId,
+        scopes: this.SCOPES,
+        redirectUri,
+        responseType: AuthSession.ResponseType.Token,
+      });
 
-      if (token && blogId) {
-        this.accessToken = token;
-        this.blogId = blogId;
+      const result = await request.promptAsync({ authorizationEndpoint: this.GOOGLE_AUTH_URL });
+
+      if (result.type === 'success') {
+        this.accessToken = result.params.access_token;
+        await secureStorage.setItem('blogger_access_token', this.accessToken!);
+        useAuthStore.getState().setAuthenticated(true);
+        useLogsStore.getState().addLog({
+          level: 'success',
+          message: 'Blogger login successful',
+          context: 'BloggerService',
+        });
         return true;
       }
       return false;
     } catch (error) {
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Failed to load Blogger credentials',
-        context: 'BloggerService',
-      });
+      console.error('Login error:', error);
       return false;
     }
   }
 
-  /**
-   * Validate connection to Blogger API
-   */
-  async validateConnection(): Promise<boolean> {
-    try {
-      if (!this.accessToken || !this.blogId) {
-        return false;
-      }
+  async createPost(post: { title: string; content: string; labels?: string[] }, isDraft: boolean = false): Promise<BloggerPost> {
+    if (!this.blogId) throw new Error('Blog ID not set');
+    
+    const response = await this.client.post(`/blogs/${this.blogId}/posts`, {
+      ...post,
+      kind: 'blogger#post',
+      blog: { id: this.blogId },
+    }, {
+      params: { isDraft }
+    });
 
-      const response = await this.client.get(`/blogs/${this.blogId}`);
-      useLogsStore.getState().addLog({
-        level: 'success',
-        message: 'Blogger connection validated',
-        context: 'BloggerService',
-      });
-      return !!response.data;
-    } catch (error) {
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Blogger connection validation failed',
-        context: 'BloggerService',
-      });
-      return false;
-    }
+    useLogsStore.getState().addLog({
+      level: 'success',
+      message: `Post created: ${post.title}`,
+      context: 'BloggerService',
+      data: { postId: response.data.id }
+    });
+
+    return response.data;
   }
 
-  /**
-   * Create a new blog post
-   */
-  async createPost(request: CreatePostRequest): Promise<BloggerPost> {
-    try {
-      if (!this.blogId) {
-        throw new Error('Blog ID not set');
-      }
-
-      const payload = {
-        title: request.title,
-        content: request.content,
-        labels: request.labels || [],
-      };
-
-      const url = request.isDraft
-        ? `/blogs/${this.blogId}/posts?isDraft=true`
-        : `/blogs/${this.blogId}/posts`;
-
-      const response = await this.client.post(url, payload);
-
-      useLogsStore.getState().addLog({
-        level: 'success',
-        message: 'Blog post created',
-        context: 'BloggerService',
-        data: { postId: response.data.id, isDraft: request.isDraft },
-      });
-
-      return response.data;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Failed to create blog post',
-        context: 'BloggerService',
-        data: { error: errorMessage, title: request.title },
-      });
-      throw error;
-    }
+  async updatePost(postId: string, post: Partial<BloggerPost>): Promise<BloggerPost> {
+    if (!this.blogId) throw new Error('Blog ID not set');
+    const response = await this.client.patch(`/blogs/${this.blogId}/posts/${postId}`, post);
+    return response.data;
   }
 
-  /**
-   * Update an existing blog post
-   */
-  async updatePost(
-    postId: string,
-    request: UpdatePostRequest
-  ): Promise<BloggerPost> {
-    try {
-      if (!this.blogId) {
-        throw new Error('Blog ID not set');
-      }
-
-      const payload = {
-        title: request.title,
-        content: request.content,
-        labels: request.labels || [],
-      };
-
-      const response = await this.client.put(
-        `/blogs/${this.blogId}/posts/${postId}`,
-        payload
-      );
-
-      useLogsStore.getState().addLog({
-        level: 'success',
-        message: 'Blog post updated',
-        context: 'BloggerService',
-        data: { postId },
-      });
-
-      return response.data;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Failed to update blog post',
-        context: 'BloggerService',
-        data: { error: errorMessage, postId },
-      });
-      throw error;
-    }
-  }
-
-  /**
-   * Publish a draft post
-   */
-  async publishPost(postId: string): Promise<BloggerPost> {
-    try {
-      if (!this.blogId) {
-        throw new Error('Blog ID not set');
-      }
-
-      const response = await this.client.post(
-        `/blogs/${this.blogId}/posts/${postId}/publish`
-      );
-
-      useLogsStore.getState().addLog({
-        level: 'success',
-        message: 'Blog post published',
-        context: 'BloggerService',
-        data: { postId },
-      });
-
-      return response.data;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Failed to publish blog post',
-        context: 'BloggerService',
-        data: { error: errorMessage, postId },
-      });
-      throw error;
-    }
-  }
-
-  /**
-   * Get a specific blog post
-   */
-  async getPost(postId: string): Promise<BloggerPost> {
-    try {
-      if (!this.blogId) {
-        throw new Error('Blog ID not set');
-      }
-
-      const response = await this.client.get(
-        `/blogs/${this.blogId}/posts/${postId}`
-      );
-
-      return response.data;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Failed to get blog post',
-        context: 'BloggerService',
-        data: { error: errorMessage, postId },
-      });
-      throw error;
-    }
-  }
-
-  /**
-   * Get all blog posts
-   */
-  async listPosts(maxResults: number = 10): Promise<BloggerPost[]> {
-    try {
-      if (!this.blogId) {
-        throw new Error('Blog ID not set');
-      }
-
-      const response = await this.client.get(
-        `/blogs/${this.blogId}/posts?maxResults=${maxResults}`
-      );
-
-      return response.data.items || [];
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Failed to list blog posts',
-        context: 'BloggerService',
-        data: { error: errorMessage },
-      });
-      throw error;
-    }
-  }
-
-  /**
-   * Delete a blog post
-   */
   async deletePost(postId: string): Promise<void> {
-    try {
-      if (!this.blogId) {
-        throw new Error('Blog ID not set');
-      }
-
-      await this.client.delete(`/blogs/${this.blogId}/posts/${postId}`);
-
-      useLogsStore.getState().addLog({
-        level: 'success',
-        message: 'Blog post deleted',
-        context: 'BloggerService',
-        data: { postId },
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Failed to delete blog post',
-        context: 'BloggerService',
-        data: { error: errorMessage, postId },
-      });
-      throw error;
-    }
+    if (!this.blogId) throw new Error('Blog ID not set');
+    await this.client.delete(`/blogs/${this.blogId}/posts/${postId}`);
   }
 
-  /**
-   * Handle API errors
-   */
-  private handleError(error: AxiosError): void {
+  async listPosts(maxResults: number = 10): Promise<BloggerPost[]> {
+    if (!this.blogId) throw new Error('Blog ID not set');
+    const response = await this.client.get(`/blogs/${this.blogId}/posts`, {
+      params: { maxResults }
+    });
+    return response.data.items || [];
+  }
+
+  private handleError(error: AxiosError) {
     const status = error.response?.status;
-    const data = error.response?.data as any;
-
-    let errorMessage = 'Unknown error';
-    let level: 'warning' | 'error' = 'error';
-
-    switch (status) {
-      case 401:
-        errorMessage = 'Unauthorized: Access token expired or invalid';
-        break;
-      case 403:
-        errorMessage = 'Forbidden: Insufficient permissions';
-        break;
-      case 404:
-        errorMessage = 'Not found: Blog or post not found';
-        level = 'warning';
-        break;
-      case 429:
-        errorMessage = 'Rate limited: Too many requests';
-        break;
-      case 500:
-        errorMessage = 'Server error: Blogger API error';
-        break;
-      default:
-        errorMessage = data?.error?.message || error.message || 'Unknown error';
+    let message = 'Blogger API Error';
+    
+    if (status === 401) {
+      message = 'Unauthorized: Please login again';
+      useAuthStore.getState().setAuthenticated(false);
+    } else if (status === 403) {
+      message = 'Forbidden: Check your Blog ID and permissions';
+    } else if (status === 404) {
+      message = 'Blog not found';
     }
 
     useLogsStore.getState().addLog({
-      level,
-      message: `Blogger API Error: ${errorMessage}`,
+      level: 'error',
+      message,
       context: 'BloggerService',
-      data: {
-        status,
-        error: data?.error?.message,
-      },
+      data: { status, detail: error.response?.data }
     });
   }
 
-  /**
-   * Clear credentials
-   */
-  async clearCredentials(): Promise<void> {
-    try {
-      await secureStorage.removeItem('blogger_access_token');
-      await secureStorage.removeItem('blogger_blog_id');
-      this.accessToken = null;
-      this.blogId = null;
-
-      useLogsStore.getState().addLog({
-        level: 'success',
-        message: 'Blogger credentials cleared',
-        context: 'BloggerService',
-      });
-    } catch (error) {
-      useLogsStore.getState().addLog({
-        level: 'error',
-        message: 'Failed to clear Blogger credentials',
-        context: 'BloggerService',
-      });
-    }
+  async logout() {
+    this.accessToken = null;
+    await secureStorage.removeItem('blogger_access_token');
+    useAuthStore.getState().setAuthenticated(false);
   }
 }
 
